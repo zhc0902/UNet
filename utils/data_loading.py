@@ -36,12 +36,15 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '',
+                 image_size: int = 0):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
         self.mask_suffix = mask_suffix
+        # >0：等比例缩放 + padding 到 image_size×image_size，保证可堆叠成 batch
+        self.image_size = image_size
 
         self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
         if not self.ids:
@@ -62,13 +65,56 @@ class BasicDataset(Dataset):
         return len(self.ids)
 
     @staticmethod
-    def preprocess(mask_values, pil_img, scale, is_mask):
+    def preprocess(mask_values, pil_img, scale, is_mask, image_size: int = 0):
+        """把图和掩膜处理成模型输入。
+
+        image_size=0        → 原版行为：只按 --scale 缩放。
+                              ⚠️ 这会导致不同图尺寸不一致，DataLoader 组 batch 时报
+                              "stack expects each tensor to be equal size"，
+                              所以 batch_size 只能设 1。
+        image_size>0        → 等比例缩放到长边 = image_size，再居中 padding 成正方形。
+                              * 不拉伸病灶（BUSI 的宽高比范围是 0.57~2.05，
+                                直接压成正方形会把病灶形状扭曲 15% 左右）
+                              * 所有图尺寸统一，batch_size>1 可用
+                              * 图像用 reflect padding（镜像边缘），避免留下
+                                统计上异常的纯黑边框被模型当成"捷径"线索
+                              * 掩膜 padding 用背景类，绝不凭空造出前景
+        """
         w, h = pil_img.size
+        if image_size and image_size > 0:
+            target = int(image_size)
+            ratio = target / max(w, h)
+            newW = max(1, int(round(w * ratio)))
+            newH = max(1, int(round(h * ratio)))
+            pil_img = pil_img.resize(
+                (newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
+            img = np.asarray(pil_img)
+
+            pad_w, pad_h = target - newW, target - newH
+            left, top = pad_w // 2, pad_h // 2
+            right, bottom = pad_w - left, pad_h - top
+
+            if is_mask:
+                fill = int(min(mask_values))          # 背景类
+                arr = np.full((target, target), fill, dtype=img.dtype)
+                arr[top:top + newH, left:left + newW] = img
+            else:
+                if img.ndim == 2:
+                    arr = np.pad(img, ((top, bottom), (left, right)), mode='reflect')
+                else:
+                    arr = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode='reflect')
+
+            return BasicDataset._to_output(arr, mask_values, is_mask, target, target)
+
         newW, newH = int(scale * w), int(scale * h)
         assert newW > 0 and newH > 0, 'Scale is too small, resized images would have no pixel'
         pil_img = pil_img.resize((newW, newH), resample=Image.NEAREST if is_mask else Image.BICUBIC)
         img = np.asarray(pil_img)
+        return BasicDataset._to_output(img, mask_values, is_mask, newH, newW)
 
+    @staticmethod
+    def _to_output(img, mask_values, is_mask, newH, newW):
+        """numpy -> 最终格式：掩膜转类别索引，图像转 CHW float。"""
         if is_mask:
             mask = np.zeros((newH, newW), dtype=np.int64)
             for i, v in enumerate(mask_values):
@@ -103,8 +149,10 @@ class BasicDataset(Dataset):
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
 
-        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
-        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img = self.preprocess(self.mask_values, img, self.scale, is_mask=False,
+                              image_size=self.image_size)
+        mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True,
+                               image_size=self.image_size)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
@@ -113,5 +161,6 @@ class BasicDataset(Dataset):
 
 
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+    def __init__(self, images_dir, mask_dir, scale=1, image_size: int = 0):
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask',
+                         image_size=image_size)
